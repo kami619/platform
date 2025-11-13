@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"ambient-code-backend/git"
 
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 )
 
 // StateBaseDir is the base directory for content storage
@@ -461,6 +463,83 @@ func ContentList(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
+// commandOrderConfig represents the structure of .claude/commands/_order.yaml
+type commandOrderConfig struct {
+	Commands []string `yaml:"commands"`
+}
+
+// parseCommandOrder reads and parses .claude/commands/_order.yaml from workflow directory
+// Returns a slice of command IDs in the specified order.
+// Returns nil if the order file doesn't exist (not an error - triggers alphabetical fallback).
+// Returns error only if the file exists but is malformed.
+func parseCommandOrder(workflowDir string) ([]string, error) {
+	orderFilePath := filepath.Join(workflowDir, ".claude", "commands", "_order.yaml")
+
+	// Check if file exists
+	if _, err := os.Stat(orderFilePath); os.IsNotExist(err) {
+		// No order file found - this is normal, not an error
+		return nil, nil
+	}
+
+	// Read file
+	data, err := os.ReadFile(orderFilePath)
+	if err != nil {
+		log.Printf("parseCommandOrder: failed to read %q: %v", orderFilePath, err)
+		return nil, err
+	}
+
+	// Parse YAML
+	var config commandOrderConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		log.Printf("parseCommandOrder: failed to parse YAML from %q: %v", orderFilePath, err)
+		return nil, err
+	}
+
+	log.Printf("parseCommandOrder: loaded command order from %q: %d commands specified", orderFilePath, len(config.Commands))
+	return config.Commands, nil
+}
+
+// sortCommandsByOrder sorts commands according to the specified order.
+// Commands in orderedIds appear first (in that order), followed by remaining commands
+// in alphabetical order. Missing commands (in orderedIds but not in commandMap) are
+// skipped with a warning. Duplicates are handled by including the command only once.
+func sortCommandsByOrder(commandMap map[string]map[string]interface{}, orderedIds []string) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, len(commandMap))
+	seen := make(map[string]bool, len(commandMap))
+
+	// First, add commands in the specified order
+	for _, cmdId := range orderedIds {
+		if cmd, exists := commandMap[cmdId]; exists {
+			if !seen[cmdId] {
+				result = append(result, cmd)
+				seen[cmdId] = true
+			}
+		} else {
+			log.Printf("sortCommandsByOrder: command %q specified in order file but not found in workflow", cmdId)
+		}
+	}
+
+	// Collect remaining commands (not in ordered list)
+	remaining := make([]string, 0)
+	for cmdId := range commandMap {
+		if !seen[cmdId] {
+			remaining = append(remaining, cmdId)
+		}
+	}
+
+	// Sort remaining commands alphabetically
+	sort.Strings(remaining)
+
+	// Add remaining commands to result
+	for _, cmdId := range remaining {
+		result = append(result, commandMap[cmdId])
+		seen[cmdId] = true
+	}
+
+	log.Printf("sortCommandsByOrder: sorted %d commands (%d ordered, %d alphabetical)", len(result), len(orderedIds), len(remaining))
+	return result
+}
+
 // ContentWorkflowMetadata handles GET /content/workflow-metadata?session=
 // Parses .claude/commands/*.md and .claude/agents/*.md files from active workflow
 func ContentWorkflowMetadata(c *gin.Context) {
@@ -491,10 +570,15 @@ func ContentWorkflowMetadata(c *gin.Context) {
 
 	// Parse commands from .claude/commands/*.md
 	commandsDir := filepath.Join(workflowDir, ".claude", "commands")
-	commands := []map[string]interface{}{}
+	commandMap := make(map[string]map[string]interface{})
 
 	if files, err := os.ReadDir(commandsDir); err == nil {
 		for _, file := range files {
+			// Skip _order.yaml file (metadata file, not a command)
+			if file.Name() == "_order.yaml" {
+				continue
+			}
+
 			if !file.IsDir() && strings.HasSuffix(file.Name(), ".md") {
 				filePath := filepath.Join(commandsDir, file.Name())
 				metadata := parseFrontmatter(filePath)
@@ -511,18 +595,45 @@ func ContentWorkflowMetadata(c *gin.Context) {
 					shortCommand = commandName[lastDot+1:]
 				}
 
-				commands = append(commands, map[string]interface{}{
+				commandMap[commandName] = map[string]interface{}{
 					"id":           commandName,
 					"name":         displayName,
 					"description":  metadata["description"],
 					"slashCommand": "/" + shortCommand,
 					"icon":         metadata["icon"],
-				})
+				}
 			}
 		}
-		log.Printf("ContentWorkflowMetadata: found %d commands", len(commands))
+		log.Printf("ContentWorkflowMetadata: found %d commands", len(commandMap))
 	} else {
 		log.Printf("ContentWorkflowMetadata: commands directory not found or unreadable: %v", err)
+	}
+
+	// Parse command order configuration
+	orderedIds, err := parseCommandOrder(workflowDir)
+	if err != nil {
+		// Log error but continue with alphabetical fallback
+		log.Printf("ContentWorkflowMetadata: failed to parse command order, falling back to alphabetical: %v", err)
+		orderedIds = nil
+	}
+
+	// Sort commands according to order file (or alphabetically if no order file)
+	var commands []map[string]interface{}
+	if orderedIds != nil && len(orderedIds) > 0 {
+		commands = sortCommandsByOrder(commandMap, orderedIds)
+	} else {
+		// Fallback: alphabetical order by command ID
+		commandIds := make([]string, 0, len(commandMap))
+		for id := range commandMap {
+			commandIds = append(commandIds, id)
+		}
+		sort.Strings(commandIds)
+
+		commands = make([]map[string]interface{}, 0, len(commandIds))
+		for _, id := range commandIds {
+			commands = append(commands, commandMap[id])
+		}
+		log.Printf("ContentWorkflowMetadata: sorted %d commands alphabetically (no order file)", len(commands))
 	}
 
 	// Parse agents from .claude/agents/*.md
